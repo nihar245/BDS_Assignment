@@ -1,0 +1,36 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime state
+data/producer_demo_state.json
+data/producer_state.json
+**/checkpoints/
+**/*.checkpoint/
+
+# Raw/generated data
+data/raw/
+*.parquet
+*.parquetdata/
+
+# dbt
+dbt/target/
+dbt/logs/
+
+# Logs
+logs/
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
