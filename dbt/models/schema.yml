@@ -1,0 +1,41 @@
+version: 2
+
+sources:
+  - name: uber
+    schema: "{{ env_var('POSTGRES_STAGING_SCHEMA', 'staging') }}"
+    tables:
+      - name: uber_demo_trips
+        description: Canonical Uber pickup events written from Kafka and Spark.
+        columns:
+          - name: trip_id
+            description: Deterministic hash-based identifier for one source row.
+          - name: event_timestamp
+          - name: pickup_latitude
+          - name: pickup_longitude
+          - name: base
+
+models:
+  - name: stg_uber_trips
+    description: Validated Uber pickup events with analytical time and geographic attributes.
+    columns:
+      - name: trip_id
+        data_tests: [not_null, unique]
+      - name: event_timestamp
+        data_tests: [not_null]
+      - name: pickup_latitude
+        data_tests: [not_null]
+      - name: pickup_longitude
+        data_tests: [not_null]
+      - name: base
+        data_tests: [not_null]
+  - name: fct_uber_trips
+    description: Analytical fact table at one row per Uber pickup.
+    columns:
+      - name: trip_id
+        data_tests: [not_null, unique]
+      - name: pickup_hour
+        data_tests: [not_null]
+  - name: agg_kpis
+    columns:
+      - name: total_trips
+        data_tests: [not_null]
