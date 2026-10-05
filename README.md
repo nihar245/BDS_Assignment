@@ -1,28 +1,119 @@
 # Uber Big Data Streaming
 
-A local streaming pipeline for the FiveThirtyEight Uber April 2014 pickup dataset. The source contains 564,516 records and the columns `Date/Time`, `Lat`, `Lon`, and `Base`. The producer emits only the supported canonical fields: `trip_id`, `event_timestamp`, `pickup_latitude`, `pickup_longitude`, and `base`.
+A local big-data streaming pipeline for the FiveThirtyEight Uber April 2014 pickup dataset. The source contains 564,516 records and the columns `Date/Time`, `Lat`, `Lon`, and `Base`.
+
+The project implements a distributed ingestion layer using a 3-node Hadoop/Spark cluster. The source dataset is divided column-wise across the cluster, where each shard contains a common `trip_id`. Spark performs a distributed join on `trip_id` to reconstruct complete Uber events before they enter the Kafka streaming pipeline.
+
+The producer emits only the supported canonical fields:
+
+`trip_id`, `event_timestamp`, `pickup_latitude`, `pickup_longitude`, and `base`.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  CSV[Uber CSV] --> P[Python producer]
-  P --> K[Kafka uber_trips]
-  K --> S[Spark Structured Streaming]
-  S --> H[HDFS Parquet]
-  S --> PG[PostgreSQL staging]
-  PG --> D[dbt analytics]
-  D --> UI[Streamlit dashboard]
-  A[Optional Airflow] --> D
+
+    CSV[Uber CSV]
+
+    subgraph CLUSTER[3-Node Distributed Ingestion Cluster]
+        M[Master Node<br/>Date/Time Shard]
+        W1[Worker 1<br/>Latitude Shard]
+        W2[Worker 2<br/>Longitude + Base Shard]
+
+        M --> J[Spark Distributed Join<br/>JOIN ON trip_id]
+        W1 --> J
+        W2 --> J
+
+        J --> E[Merged Uber Events]
+    end
+
+    CSV --> M
+    CSV --> W1
+    CSV --> W2
+
+    E --> K[Kafka<br/>uber_trips]
+
+    K --> S[Spark Structured Streaming]
+
+    S --> H[Hadoop HDFS<br/>Parquet]
+    S --> PG[PostgreSQL<br/>staging]
+
+    PG --> D[dbt Analytics]
+    D --> UI[Streamlit Dashboard]
+
+    A[Airflow] --> D
 ```
 
-The core path is Kafka -> Spark -> HDFS plus PostgreSQL. Airflow is optional and only orchestrates the dbt batch workflow. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for responsibilities and boundaries.
+## Distributed Ingestion
 
-## Prerequisites and environment
+The source dataset is divided into three column-wise shards:
 
-The working setup assumes Windows with Java 8, Hadoop 3.3.6, Spark 3.5.9, PostgreSQL 17, Docker Desktop, Git, and Miniconda/Conda already installed. The repository does not install Miniconda, Java, Hadoop, Spark, PostgreSQL, or Docker Desktop.
+```text
+Master Node
+    trip_id + Date/Time
 
-Copy `.env.example` to `.env` and fill in local values. Never commit `.env` or `airflow/.env`. From Windows PowerShell, load the root environment into the current process without printing it:
+Worker 1
+    trip_id + Lat
+
+Worker 2
+    trip_id + Lon + Base
+```
+
+Each record uses the same deterministic `trip_id`.
+
+Spark performs a distributed join:
+
+```text
+Date/Time Shard
+       \
+        \
+Latitude Shard ----> JOIN ON trip_id ----> Complete Uber Event
+        /
+       /
+Lon + Base Shard
+```
+
+The resulting canonical event is:
+
+```json
+{
+  "trip_id": "uber-3d7b142f0c24e77ba450",
+  "event_timestamp": "2014-04-01T00:11:00+00:00",
+  "pickup_latitude": 40.769,
+  "pickup_longitude": -73.9549,
+  "base": "B02512"
+}
+```
+
+The distributed ingestion stage supports a controlled streaming demonstration:
+
+- First 50,000 records are processed immediately.
+- Remaining records are emitted at 20 records every 10 seconds.
+- Complete events are then passed into the Kafka streaming pipeline.
+
+The distributed ingestion layer is responsible for reconstructing complete events from distributed source shards. Kafka and Spark Structured Streaming handle the downstream event-streaming and processing stages.
+
+See `docs/ARCHITECTURE.md` for responsibilities and boundaries.
+
+## Prerequisites and Environment
+
+The working setup assumes Windows with:
+
+- Java 8
+- Hadoop 3.3.6
+- Spark 3.5.9
+- PostgreSQL 17
+- Docker Desktop
+- Git
+- Miniconda/Conda
+
+The repository does not install Miniconda, Java, Hadoop, Spark, PostgreSQL, or Docker Desktop.
+
+Copy `.env.example` to `.env` and fill in local values.
+
+Never commit `.env` or `airflow/.env`.
+
+From Windows PowerShell, load the root environment into the current process without printing it:
 
 ```powershell
 Get-Content .env | ForEach-Object {
@@ -32,94 +123,435 @@ Get-Content .env | ForEach-Object {
 }
 ```
 
-This loading step is required before host-side `dbt` commands. For the Airflow containers, Compose loads the same file with `env_file: ../.env` and overrides `POSTGRES_HOST` to `host.docker.internal`.
+This loading step is required before host-side `dbt` commands.
 
-## Reproducible startup order
+For the Airflow containers, Compose loads the same file with:
 
-1. **PowerShell:** clone the repository and copy `.env.example` to `.env`.
-2. **PowerShell:** run `./scripts/setup_env.ps1`, then `conda activate bds-uber`.
-3. **Git Bash:** download the dataset with `bash scripts/download_dataset.sh`. The CSV remains ignored under `data/raw/`.
-4. **Docker:** start the one-broker Kafka KRaft service with `docker compose -f kafka/docker-compose.yml up -d`.
-5. **Docker/PowerShell:** create or check topic `uber_trips` with the command in [docs/KAFKA.md](docs/KAFKA.md). The broker is available at `localhost:9092`.
-6. **Host:** start the existing Hadoop/HDFS services and verify PostgreSQL 17 is running with database `uber_streaming`.
-7. **Spark:** start Structured Streaming with the command below. It writes both HDFS and PostgreSQL.
-8. **PowerShell:** run the producer with the command below. The default demo sends 10 events every 10 seconds and persists its position in `data/producer_state.json`. Streamlit refreshes its dashboard fragment every 10 seconds.
-9. **Host:** verify HDFS output and PostgreSQL `staging.uber_trips` using the existing local tools.
-10. **PowerShell:** load `.env`, then run `dbt deps`, `dbt run --profiles-dir .`, and `dbt test --profiles-dir .` from `dbt/`.
-11. **Docker:** start optional Airflow from `airflow/`; use [docs/AIRFLOW.md](docs/AIRFLOW.md) for the existing-container and fresh-setup commands.
-12. **Airflow UI:** trigger or inspect `uber_pipeline_dbt` and verify `dbt_deps`, `dbt_run`, and `dbt_test`.
-13. **PowerShell:** start Streamlit with `streamlit run dashboard/app.py`.
+```yaml
+env_file: ../.env
+```
 
-Keep Kafka, Hadoop/HDFS, and Spark running simultaneously for the streaming demo. PostgreSQL must remain available for the JDBC sink. Airflow and Streamlit are separate optional processes for batch orchestration and analytics viewing.
+and overrides `POSTGRES_HOST` to:
 
-## Quick commands
+```text
+host.docker.internal
+```
+
+## Reproducible Startup Order
+
+### 1. Clone the Repository
+
+```powershell
+git clone <repository-url>
+cd BDS_robust_dashboard
+```
+
+Copy `.env.example` to `.env`.
+
+### 2. Activate the Environment
+
+```powershell
+./scripts/setup_env.ps1
+conda activate bds-uber
+```
+
+### 3. Download the Dataset
+
+From Git Bash:
 
 ```bash
-python -m producer.uber_producer --batch-size 10 --interval-seconds 10 --limit 100
-spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9,org.postgresql:postgresql:42.7.7 spark_streaming/stream_all_events.py
-cd dbt && dbt run --profiles-dir . && dbt test --profiles-dir .
+bash scripts/download_dataset.sh
+```
+
+The CSV remains ignored under `data/raw/`.
+
+### 4. Start the Distributed Hadoop/Spark Cluster
+
+The project uses a 3-node logical cluster:
+
+```text
+Master Node
+├── Hadoop NameNode
+└── Spark Master
+
+Worker 1
+├── Hadoop DataNode
+└── Spark Worker
+
+Worker 2
+├── Hadoop DataNode
+└── Spark Worker
+```
+
+Start the cluster services using the scripts under:
+
+```text
+scripts/
+```
+
+Verify HDFS:
+
+```powershell
+hdfs dfsadmin -report
+```
+
+The cluster should show two live DataNodes.
+
+Verify the Spark Master UI and confirm that both Spark Workers are registered.
+
+### 5. Run Distributed Ingestion
+
+The distributed ingestion stage reads the three HDFS shards:
+
+```text
+/data/uber/cluster_input/master_datetime.csv
+/data/uber/cluster_input/worker1_lat.csv
+/data/uber/cluster_input/worker2_lon_base.csv
+```
+
+Spark performs the distributed join on `trip_id`.
+
+The merged dataset is written to:
+
+```text
+/data/uber/cluster_merged
+```
+
+Run the distributed ingestion job:
+
+```powershell
+spark-submit `
+  --master spark://localhost:7077 `
+  distributed_ingestion/cluster_distributed_stream.py
+```
+
+The demonstration starts with:
+
+```text
+50,000 records immediately
+```
+
+and then continues with:
+
+```text
+20 records every 10 seconds
+```
+
+### 6. Start Kafka
+
+Start the one-broker Kafka KRaft service:
+
+```powershell
+docker compose -f kafka/docker-compose.yml up -d
+```
+
+Create or verify the `uber_trips` topic using the commands in `docs/KAFKA.md`.
+
+The broker is available at:
+
+```text
+localhost:9092
+```
+
+### 7. Start Spark Structured Streaming
+
+Run:
+
+```powershell
+spark-submit `
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9,org.postgresql:postgresql:42.7.7 `
+  spark_streaming/stream_all_events.py
+```
+
+Spark consumes the complete events from Kafka and writes them to both HDFS and PostgreSQL.
+
+### 8. Start PostgreSQL
+
+PostgreSQL 17 must be running with database:
+
+```text
+uber_streaming
+```
+
+The database contains the staging and analytics layers used by the project.
+
+### 9. Run dbt
+
+From the `dbt/` directory:
+
+```powershell
+dbt deps
+dbt run --profiles-dir .
+dbt test --profiles-dir .
+```
+
+dbt transforms PostgreSQL staging data into analytics-ready models and performs data-quality tests.
+
+### 10. Start Airflow
+
+Airflow is used as the orchestration layer for the dbt workflow.
+
+For a fresh metadata volume:
+
+```powershell
+cd airflow
+docker compose --env-file ../.env up airflow-init
+```
+
+Then:
+
+```powershell
+docker compose --env-file ../.env up -d
+```
+
+The Airflow DAG:
+
+```text
+uber_pipeline_dbt
+```
+
+orchestrates:
+
+```text
+dbt run
+   ↓
+dbt test
+```
+
+Airflow is an orchestration component and does not replace Kafka or Spark in the streaming path.
+
+### 11. Start Streamlit
+
+```powershell
 streamlit run dashboard/app.py
 ```
 
-## Commands by responsibility
+The dashboard reads the analytics data from PostgreSQL.
 
-- **Windows/PowerShell:** `./scripts/setup_env.ps1`; then `conda activate bds-uber`.
-- **Docker:** `docker compose -f kafka/docker-compose.yml up -d`.
-- **Spark:** run `spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9,org.postgresql:postgresql:42.7.7 spark_streaming/stream_all_events.py` from the repository root.
-- **PostgreSQL:** execute `postgres/sql/001_create_schemas.sql`, `002_create_staging_table.sql`, and `003_analytics_views.sql`; for an existing database, also run `004_streaming_resilience.sql` with `psql`.
-- **dbt:** from `dbt/`, run `dbt deps`, `dbt run --profiles-dir .`, and `dbt test --profiles-dir .`.
-- **Airflow:** optional; from `airflow/`, run `docker compose --env-file ../.env up airflow-init` only for a fresh metadata volume, then `docker compose --env-file ../.env up -d`.
+## Quick Commands
 
-The actual dataset is downloaded at runtime and ignored by Git. No credentials or unsupported Uber fields are included.
+### Check HDFS Cluster
 
-## Verified results
+```powershell
+hdfs dfsadmin -report
+```
 
-These results were manually verified in the working Windows setup:
+### Distributed Ingestion
 
-- Dataset processed: 564,516 records.
-- PostgreSQL: `staging.uber_trips` contains 564,516 rows.
-- dbt: the staging, fact, KPI, time, base, day-type, heatmap, base-hour, and geographic analytics models are built and tested.
-- dbt tests: 12/12 passed.
-- Airflow: `dbt_deps`, `dbt_run`, and `dbt_test` succeeded.
-- Streamlit: dashboard displays the PostgreSQL analytics.
+```powershell
+spark-submit `
+  --master spark://localhost:7077 `
+  distributed_ingestion/cluster_distributed_stream.py
+```
 
+### Kafka
 
-## Streaming demo behavior
+```powershell
+docker compose -f kafka/docker-compose.yml up -d
+```
 
-The producer is intentionally restart-safe for the live demonstration:
+### Spark Structured Streaming
 
-- Default batch size: 10 events.
-- Default interval: 10 seconds between batches.
-- Producer position is stored in `data/producer_state.json`, which is ignored by Git.
-- Kafka uses `acks=all` and retries.
-- PostgreSQL loads through `staging.uber_trips_ingest` and merges with `ON CONFLICT DO NOTHING`, so replayed Kafka events do not fail the primary-key boundary.
-- Spark derives dates/hours using `America/New_York`, matching the source dataset's local pickup timestamps.
-- HDFS remains the append-oriented processed-data lake; PostgreSQL is the idempotent serving boundary.
+```powershell
+spark-submit `
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.9,org.postgresql:postgresql:42.7.7 `
+  spark_streaming/stream_all_events.py
+```
 
-Do not reset the producer state or Kafka topic while a previous Spark checkpoint is still being reused unless you intentionally want to replay the same events. For a clean isolated demonstration, use a fresh topic/checkpoint/output path rather than deleting existing project data.
+### dbt
 
-## Dashboard metrics
+```powershell
+cd dbt
+dbt run --profiles-dir .
+dbt test --profiles-dir .
+```
 
-The dashboard is deliberately limited to fields supported by the source data. It includes total trips, active bases, average/median daily trips, busiest and quietest hours, peak-hour share, weekday/weekend split, time-of-day distribution, daily percentage change, seven-day rolling average, day-by-hour activity, base/hour analysis, geographic grid density, duplicate/coordinate quality checks, and Spark batch metrics. It does not invent fare, distance, duration, passenger, payment, or revenue fields because those columns are not present in the FiveThirtyEight dataset.
+### Streamlit
 
-## Technology responsibilities
+```powershell
+streamlit run dashboard/app.py
+```
 
-- Python and Kafka: deterministic event conversion and delivery.
-- Spark Structured Streaming: JSON parsing, validation, New York local-time enrichment, checkpointed Parquet writes, and idempotent PostgreSQL batch loading.
-- HDFS: processed data-lake storage.
-- PostgreSQL: durable staging table, idempotent ingest boundary, and streaming batch metrics.
-- dbt: documented analytical models and data-quality tests.
-- Streamlit: PostgreSQL-backed KPI, time, base, geographic, data-quality, and streaming-health exploration.
-- Airflow: optional scheduled dbt orchestration only.
+## Commands by Responsibility
 
-## Academic project framing
+- **Distributed ingestion:** Hadoop HDFS + Spark standalone cluster.
+- **Python:** deterministic event preparation and distributed ingestion logic.
+- **Kafka:** event/message streaming.
+- **Spark Structured Streaming:** JSON parsing, validation, local-time enrichment, checkpointed Parquet writes, and PostgreSQL batch loading.
+- **HDFS:** distributed data-lake storage.
+- **PostgreSQL:** durable staging table, idempotent ingest boundary, and streaming batch metrics.
+- **dbt:** SQL-based analytical transformations and data-quality tests.
+- **Airflow:** orchestration of the dbt workflow.
+- **Streamlit:** PostgreSQL-backed analytics dashboard.
+- **Docker:** Kafka and Airflow containerization.
 
-This project illustrates a complete local big-data streaming architecture, including an immutable event contract, stream processing, partitioned lake storage, warehouse-style modeling, quality checks, and visualization. Infrastructure provisioning and performance benchmarking are intentionally outside the repository scope.
+## Verified Results
 
-## Development phases
+The working setup was manually verified with:
+
+- Dataset processed: **564,516 records**
+- PostgreSQL staging: **564,516 rows**
+- dbt analytical models successfully built
+- dbt tests: **12/12 passed**
+- Airflow dbt workflow successfully executed
+- Streamlit dashboard successfully displays PostgreSQL analytics
+- Hadoop cluster: **1 NameNode + 2 DataNodes**
+- Spark cluster: **1 Master + 2 Workers**
+- Distributed ingestion successfully reconstructs complete events by joining the three source shards on `trip_id`
+- HDFS stores the distributed merged dataset as Parquet
+
+## Streaming Demo Behavior
+
+The distributed ingestion stage supports the controlled demonstration:
+
+- **50,000 records** are processed as an initial head-start.
+- Remaining records are emitted at **20 records every 10 seconds**.
+- The complete event contract remains:
+  - `trip_id`
+  - `event_timestamp`
+  - `pickup_latitude`
+  - `pickup_longitude`
+  - `base`
+
+The downstream Kafka → Spark Structured Streaming pipeline consumes these complete events.
+
+The streaming pipeline is restart-safe, with Kafka acknowledgements, Spark checkpoints, and PostgreSQL idempotency preventing duplicate primary-key inserts.
+
+For a clean isolated demonstration, use a fresh topic, checkpoint, or output path rather than deleting existing project data.
+
+## Dashboard Metrics
+
+The dashboard is deliberately limited to fields supported by the source data.
+
+It includes:
+
+- Total trips
+- Active bases
+- Average and median daily trips
+- Busiest and quietest hours
+- Peak-hour share
+- Weekday/weekend split
+- Time-of-day distribution
+- Daily percentage change
+- Seven-day rolling average
+- Day-by-hour activity
+- Base/hour analysis
+- Geographic grid density
+- Coordinate-quality checks
+- Duplicate checks
+- Spark batch metrics
+- Streaming health information
+
+The project does not invent fare, distance, duration, passenger, payment, driver, or revenue fields because those columns are not present in the FiveThirtyEight Uber dataset.
+
+## Technology Responsibilities
+
+### Distributed Ingestion Cluster
+
+The 3-node Hadoop/Spark cluster demonstrates distributed processing and storage:
+
+```text
+                    Master Node
+                    /          \
+             NameNode        Spark Master
+                 |                |
+                 |        +-------+-------+
+                 |        |               |
+             Worker 1                 Worker 2
+             DataNode                 DataNode
+             Spark Worker             Spark Worker
+```
+
+The source data is distributed column-wise across the nodes:
+
+```text
+Master:
+trip_id + Date/Time
+
+Worker 1:
+trip_id + Lat
+
+Worker 2:
+trip_id + Lon + Base
+```
+
+Spark reconstructs complete events by performing a distributed join on `trip_id`.
+
+### Kafka
+
+Kafka acts as the event-streaming layer between distributed ingestion and Spark Structured Streaming.
+
+### Spark Structured Streaming
+
+Spark consumes Kafka events, validates and enriches them, and writes the processed data to HDFS and PostgreSQL.
+
+### HDFS
+
+HDFS provides distributed storage for processed event data.
+
+### PostgreSQL
+
+PostgreSQL provides the durable relational staging and serving layer.
+
+### dbt
+
+dbt converts PostgreSQL staging data into analytical models and performs data-quality testing.
+
+### Airflow
+
+Airflow orchestrates the recurring dbt workflow.
+
+### Streamlit
+
+Streamlit provides the final analytics dashboard.
+
+## Academic Project Framing
+
+This project demonstrates a complete local big-data architecture combining:
+
+```text
+Distributed Ingestion
+        ↓
+HDFS + Spark Cluster
+        ↓
+Kafka Event Streaming
+        ↓
+Spark Structured Streaming
+        ↓
+HDFS + PostgreSQL
+        ↓
+dbt Analytics
+        ↓
+Streamlit Dashboard
+```
+
+The architecture demonstrates:
+
+- Distributed storage
+- Distributed processing
+- Distributed data ingestion
+- Event streaming
+- Stream processing
+- SQL-based analytical transformation
+- Data-quality validation
+- Workflow orchestration
+- Dashboard visualization
+
+The project uses technologies from the Hadoop/Spark big-data ecosystem while keeping the complete workflow reproducible on a local Windows environment.
+
+Infrastructure provisioning and large-scale performance benchmarking are outside the repository scope.
+
+## Development Phases
 
 1. **Application cleanup:** producer, Kafka, Spark, HDFS, PostgreSQL, dbt, and Streamlit.
 2. **Docker infrastructure:** Kafka Docker and optional Airflow Docker.
-3. **End-to-end local testing:** producer -> Kafka -> Spark -> HDFS/PostgreSQL -> dbt -> dashboard.
-4. **Future three-node cluster:** one NameNode/Spark Master/Kafka node and two DataNode/Spark Worker nodes. This phase is intentionally deferred.
-5. **Airflow orchestration:** optional Docker Airflow for batch/dbt workflow.
+3. **End-to-end local testing:** distributed ingestion → Kafka → Spark → HDFS/PostgreSQL → dbt → dashboard.
+4. **Three-node distributed cluster:** one Master node and two Worker nodes with HDFS and Spark services.
+5. **Distributed ingestion:** column-wise source shards stored in HDFS and joined using Spark on `trip_id`.
+6. **Controlled streaming demonstration:** 50,000-record head-start followed by 20 records every 10 seconds.
+7. **Kafka integration:** complete events from the distributed ingestion layer are passed into the existing Kafka topic.
+8. **Streaming processing:** Spark Structured Streaming consumes Kafka events and writes to HDFS and PostgreSQL.
+9. **Analytics layer:** dbt models and data-quality tests.
+10. **Orchestration:** Airflow executes the dbt workflow.
+11. **Visualization:** Streamlit provides the final analytics dashboard.
+```
