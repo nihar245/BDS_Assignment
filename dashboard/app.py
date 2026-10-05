@@ -14,21 +14,23 @@ st.caption("FiveThirtyEight Uber pickup data • Kafka → Spark → HDFS/Postgr
 
 @st.cache_resource
 def connection():
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         host=os.getenv("POSTGRES_HOST", "localhost"),
         port=os.getenv("POSTGRES_PORT", "5432"),
         dbname=os.getenv("POSTGRES_DB", "uber_streaming"),
         user=os.getenv("POSTGRES_USER", "postgres"),
         password=os.getenv("POSTGRES_PASSWORD", ""),
     )
+    conn.autocommit = True
+    return conn
 
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=20)
 def query(sql: str) -> pd.DataFrame:
     return pd.read_sql_query(sql, connection())
 
 
-@st.fragment(run_every="10s")
+@st.fragment(run_every="30s")
 def render_dashboard():
     try:
         kpis = query("SELECT * FROM analytics.agg_kpis").iloc[0]
@@ -107,24 +109,5 @@ def render_dashboard():
         stream_cols[2].metric("Batches Recorded", len(batches))
         stream_cols[3].metric("Last Processed", str(latest["processed_at"]))
         st.dataframe(batches, use_container_width=True, hide_index=True)
-
-    st.subheader("Data Quality")
-    quality = query(
-        """
-        SELECT
-            COUNT(*) AS total_rows,
-            COUNT(*) FILTER (WHERE pickup_latitude BETWEEN -90 AND 90 AND pickup_longitude BETWEEN -180 AND 180) AS valid_coordinates,
-            COUNT(DISTINCT trip_id) AS unique_trip_ids,
-            COUNT(*) - COUNT(DISTINCT trip_id) AS duplicate_trip_ids
-        FROM staging.uber_trips
-        """
-    )
-    q = quality.iloc[0]
-    qcols = st.columns(4)
-    qcols[0].metric("Rows", f"{int(q['total_rows']):,}")
-    qcols[1].metric("Valid Coordinates", f"{int(q['valid_coordinates']):,}")
-    qcols[2].metric("Unique Trip IDs", f"{int(q['unique_trip_ids']):,}")
-    qcols[3].metric("Duplicate Trip IDs", f"{int(q['duplicate_trip_ids']):,}")
-
 
 render_dashboard()

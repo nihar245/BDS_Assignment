@@ -1,4 +1,5 @@
 uber_streaming:
+  target: dev
   outputs:
     dev:
       type: postgres
@@ -8,5 +9,5 @@ uber_streaming:
       password: "{{ env_var('POSTGRES_PASSWORD') }}"
       dbname: "{{ env_var('POSTGRES_DB') }}"
       schema: "{{ env_var('POSTGRES_SCHEMA', 'analytics') }}"
-      threads: 4
+      threads: 1
   target: dev
